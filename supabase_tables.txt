@@ -1,0 +1,545 @@
+-- Pasturewatch tables for the Supabase SQL editor.
+-- Covers ranch accounts, geofences, animals, TTGO collars, the SIM gateway,
+-- LoRaWAN uplinks, alerts, and the dashboard assistant.
+-- Run the whole file once on a new project. auth.users already exists in Supabase.
+
+-- ---------------------------------------------------------------------------
+-- Enums
+-- ---------------------------------------------------------------------------
+
+create type public.user_role as enum (
+  'ranch_manager',
+  'herder',
+  'veterinarian',
+  'viewer'
+);
+
+create type public.animal_sex as enum (
+  'cow',
+  'bull',
+  'heifer',
+  'steer'
+);
+
+create type public.collar_motion as enum (
+  'graze',
+  'stray',
+  'still',
+  'offline'
+);
+
+create type public.alert_type as enum (
+  'geofence',
+  'temperature',
+  'immobility',
+  'battery',
+  'signal'
+);
+
+create type public.alert_severity as enum (
+  'information',
+  'warning',
+  'critical'
+);
+
+create type public.gateway_status as enum (
+  'simulated',
+  'registered',
+  'offline'
+);
+
+create type public.chat_role as enum (
+  'user',
+  'assistant'
+);
+
+-- ---------------------------------------------------------------------------
+-- Shared updated_at trigger
+-- ---------------------------------------------------------------------------
+
+create or replace function public.set_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- ranches
+-- One ranch owns pastures, animals, collars, and the SIM gateway.
+-- Thresholds match the dashboard validation targets.
+-- ---------------------------------------------------------------------------
+
+create table public.ranches (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  heat_warn_c numeric(4, 1) not null default 39.2,
+  heat_critical_c numeric(4, 1) not null default 39.8,
+  still_accel_ms2 numeric(5, 2) not null default 0.40,
+  still_ticks integer not null default 4,
+  battery_warn_percent numeric(5, 2) not null default 15,
+  rssi_warn_dbm integer not null default -126,
+  range_target_km numeric(4, 1) not null default 3,
+  response_target_sec integer not null default 30,
+  gps_target_m numeric(5, 1) not null default 10,
+  dashboard_target_sec numeric(4, 1) not null default 2,
+  reliability_target_pct numeric(5, 2) not null default 95,
+  geofence_target_pct numeric(5, 2) not null default 100,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create trigger ranches_set_updated_at
+  before update on public.ranches
+  for each row execute function public.set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- profiles
+-- One row per Supabase Auth user. ranch_id is null until they join a ranch.
+-- ---------------------------------------------------------------------------
+
+create table public.profiles (
+  id uuid primary key references auth.users (id) on delete cascade,
+  ranch_id uuid references public.ranches (id) on delete set null,
+  full_name text not null default '',
+  email text not null,
+  phone text not null default '',
+  role public.user_role not null default 'viewer',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index profiles_ranch_id_idx on public.profiles (ranch_id);
+create index profiles_email_idx on public.profiles (lower(email));
+
+create trigger profiles_set_updated_at
+  before update on public.profiles
+  for each row execute function public.set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- notification_settings
+-- Settings page: which collar events this user wants called out.
+-- ---------------------------------------------------------------------------
+
+create table public.notification_settings (
+  user_id uuid primary key references public.profiles (id) on delete cascade,
+  notify_geofence boolean not null default true,
+  notify_heat boolean not null default true,
+  notify_still boolean not null default true,
+  notify_battery boolean not null default true,
+  notify_offline boolean not null default true,
+  updated_at timestamptz not null default now()
+);
+
+create trigger notification_settings_set_updated_at
+  before update on public.notification_settings
+  for each row execute function public.set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- pastures
+-- Geofence ring for a grazing block. points is [{ "lat": -29.07, "lng": 26.16 }, ...]
+-- in boundary order. The dashboard pasture is "Home pasture".
+-- ---------------------------------------------------------------------------
+
+create table public.pastures (
+  id uuid primary key default gen_random_uuid(),
+  ranch_id uuid not null references public.ranches (id) on delete cascade,
+  name text not null,
+  boundary jsonb not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint pastures_boundary_is_array check (jsonb_typeof(boundary) = 'array')
+);
+
+create index pastures_ranch_id_idx on public.pastures (ranch_id);
+
+create trigger pastures_set_updated_at
+  before update on public.pastures
+  for each row execute function public.set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- gateways
+-- SIM card module used as the LoRaWAN backhaul for the ranch.
+-- ---------------------------------------------------------------------------
+
+create table public.gateways (
+  id uuid primary key default gen_random_uuid(),
+  ranch_id uuid not null references public.ranches (id) on delete cascade,
+  name text not null,
+  sim_id text,
+  backhaul text not null default 'LTE',
+  network_server text not null default 'The Things Network',
+  status public.gateway_status not null default 'simulated',
+  last_seen_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index gateways_ranch_id_idx on public.gateways (ranch_id);
+
+create trigger gateways_set_updated_at
+  before update on public.gateways
+  for each row execute function public.set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- animals
+-- Herd identity. Live sensor values live on collars and uplinks, not here.
+-- ---------------------------------------------------------------------------
+
+create table public.animals (
+  id uuid primary key default gen_random_uuid(),
+  ranch_id uuid not null references public.ranches (id) on delete cascade,
+  pasture_id uuid references public.pastures (id) on delete set null,
+  tag text not null,
+  name text not null,
+  sex public.animal_sex not null,
+  breed text not null,
+  age_years integer not null check (age_years >= 0),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (ranch_id, tag)
+);
+
+create index animals_ranch_id_idx on public.animals (ranch_id);
+create index animals_pasture_id_idx on public.animals (pasture_id);
+
+create trigger animals_set_updated_at
+  before update on public.animals
+  for each row execute function public.set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- collars
+-- One TTGO LoRaWAN controller per animal. dev_eui is the Things Network identity.
+-- Latest radio and power figures are cached here; history is in uplinks.
+-- ---------------------------------------------------------------------------
+
+create table public.collars (
+  id uuid primary key default gen_random_uuid(),
+  ranch_id uuid not null references public.ranches (id) on delete cascade,
+  animal_id uuid unique references public.animals (id) on delete set null,
+  gateway_id uuid references public.gateways (id) on delete set null,
+  dev_eui text not null unique,
+  motion public.collar_motion not null default 'graze',
+  battery_percent numeric(5, 2) not null default 100,
+  rssi_dbm integer,
+  snr numeric(5, 1),
+  spreading_factor integer not null default 9 check (spreading_factor between 7 and 12),
+  last_seen_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index collars_ranch_id_idx on public.collars (ranch_id);
+create index collars_gateway_id_idx on public.collars (gateway_id);
+
+create trigger collars_set_updated_at
+  before update on public.collars
+  for each row execute function public.set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- uplinks
+-- One row per TTGO packet after MQTT / Node-RED stores it.
+-- Temperature, accelerometer, LDR, GPS, and the LoRa link budget.
+-- ---------------------------------------------------------------------------
+
+create table public.uplinks (
+  id uuid primary key default gen_random_uuid(),
+  collar_id uuid not null references public.collars (id) on delete cascade,
+  received_at timestamptz not null default now(),
+  lat double precision not null,
+  lng double precision not null,
+  heading_rad double precision,
+  gps_accuracy_m numeric(6, 1) not null,
+  temperature_c numeric(4, 1) not null,
+  accel_ms2 numeric(6, 2) not null,
+  lux numeric(8, 1) not null,
+  battery_percent numeric(5, 2) not null,
+  rssi_dbm integer not null,
+  snr numeric(5, 1) not null,
+  spreading_factor integer not null check (spreading_factor between 7 and 12),
+  outside_fence boolean not null default false,
+  distance_outside_m numeric(8, 1) not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create index uplinks_collar_received_idx on public.uplinks (collar_id, received_at desc);
+create index uplinks_received_at_idx on public.uplinks (received_at desc);
+
+-- ---------------------------------------------------------------------------
+-- alerts
+-- Geofence, heat, stillness, battery, and weak-signal events.
+-- acknowledged_at is the operator response used for alert response time.
+-- ---------------------------------------------------------------------------
+
+create table public.alerts (
+  id uuid primary key default gen_random_uuid(),
+  ranch_id uuid not null references public.ranches (id) on delete cascade,
+  animal_id uuid not null references public.animals (id) on delete cascade,
+  collar_id uuid references public.collars (id) on delete set null,
+  uplink_id uuid references public.uplinks (id) on delete set null,
+  type public.alert_type not null,
+  severity public.alert_severity not null,
+  message text not null,
+  created_at timestamptz not null default now(),
+  acknowledged_at timestamptz,
+  acknowledged_by uuid references public.profiles (id) on delete set null,
+  resolved_at timestamptz
+);
+
+create index alerts_ranch_open_idx on public.alerts (ranch_id, created_at desc);
+create index alerts_animal_type_idx on public.alerts (animal_id, type);
+
+-- ---------------------------------------------------------------------------
+-- chat_messages
+-- Assistant page. Messages are scoped to the signed-in user.
+-- ---------------------------------------------------------------------------
+
+create table public.chat_messages (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  ranch_id uuid references public.ranches (id) on delete set null,
+  role public.chat_role not null,
+  body text not null,
+  created_at timestamptz not null default now()
+);
+
+create index chat_messages_user_created_idx on public.chat_messages (user_id, created_at);
+
+-- ---------------------------------------------------------------------------
+-- Latest uplink per collar, used by the herd cards and the live map.
+-- ---------------------------------------------------------------------------
+
+create view public.collar_latest as
+select distinct on (u.collar_id)
+  u.id as uplink_id,
+  u.collar_id,
+  c.animal_id,
+  c.ranch_id,
+  c.dev_eui,
+  c.motion,
+  u.received_at,
+  u.lat,
+  u.lng,
+  u.heading_rad,
+  u.gps_accuracy_m,
+  u.temperature_c,
+  u.accel_ms2,
+  u.lux,
+  u.battery_percent,
+  u.rssi_dbm,
+  u.snr,
+  u.spreading_factor,
+  u.outside_fence,
+  u.distance_outside_m
+from public.uplinks u
+join public.collars c on c.id = u.collar_id
+order by u.collar_id, u.received_at desc;
+
+-- ---------------------------------------------------------------------------
+-- New auth user gets a profile and default notification settings.
+-- Pass ranch_id and role in the sign-up metadata when you have them.
+-- ---------------------------------------------------------------------------
+
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  chosen_role public.user_role := 'viewer';
+begin
+  if new.raw_user_meta_data->>'role' in ('ranch_manager', 'herder', 'veterinarian', 'viewer') then
+    chosen_role := (new.raw_user_meta_data->>'role')::public.user_role;
+  end if;
+
+  insert into public.profiles (id, full_name, email, phone, role, ranch_id)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data->>'full_name', ''),
+    coalesce(new.email, ''),
+    coalesce(new.raw_user_meta_data->>'phone', ''),
+    chosen_role,
+    nullif(new.raw_user_meta_data->>'ranch_id', '')::uuid
+  );
+
+  insert into public.notification_settings (user_id) values (new.id);
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- ---------------------------------------------------------------------------
+-- Ranch helper for row level security
+-- ---------------------------------------------------------------------------
+
+create or replace function public.current_ranch_id()
+returns uuid
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select ranch_id from public.profiles where id = auth.uid()
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Row level security
+-- ---------------------------------------------------------------------------
+
+alter table public.ranches enable row level security;
+alter table public.profiles enable row level security;
+alter table public.notification_settings enable row level security;
+alter table public.pastures enable row level security;
+alter table public.gateways enable row level security;
+alter table public.animals enable row level security;
+alter table public.collars enable row level security;
+alter table public.uplinks enable row level security;
+alter table public.alerts enable row level security;
+alter table public.chat_messages enable row level security;
+
+create policy "members read their ranch"
+  on public.ranches for select
+  to authenticated
+  using (id = public.current_ranch_id());
+
+create policy "managers update their ranch"
+  on public.ranches for update
+  to authenticated
+  using (
+    id = public.current_ranch_id()
+    and exists (
+      select 1 from public.profiles
+      where id = auth.uid() and role = 'ranch_manager'
+    )
+  );
+
+create policy "read profiles on the same ranch"
+  on public.profiles for select
+  to authenticated
+  using (id = auth.uid() or ranch_id = public.current_ranch_id());
+
+create policy "users update their own profile"
+  on public.profiles for update
+  to authenticated
+  using (id = auth.uid())
+  with check (id = auth.uid());
+
+create policy "users read their notification settings"
+  on public.notification_settings for select
+  to authenticated
+  using (user_id = auth.uid());
+
+create policy "users update their notification settings"
+  on public.notification_settings for update
+  to authenticated
+  using (user_id = auth.uid())
+  with check (user_id = auth.uid());
+
+create policy "members read pastures"
+  on public.pastures for select
+  to authenticated
+  using (ranch_id = public.current_ranch_id());
+
+create policy "managers write pastures"
+  on public.pastures for all
+  to authenticated
+  using (
+    ranch_id = public.current_ranch_id()
+    and exists (
+      select 1 from public.profiles
+      where id = auth.uid() and role = 'ranch_manager'
+    )
+  )
+  with check (ranch_id = public.current_ranch_id());
+
+create policy "members read gateways"
+  on public.gateways for select
+  to authenticated
+  using (ranch_id = public.current_ranch_id());
+
+create policy "members read animals"
+  on public.animals for select
+  to authenticated
+  using (ranch_id = public.current_ranch_id());
+
+create policy "herd staff write animals"
+  on public.animals for all
+  to authenticated
+  using (
+    ranch_id = public.current_ranch_id()
+    and exists (
+      select 1 from public.profiles
+      where id = auth.uid() and role in ('ranch_manager', 'herder', 'veterinarian')
+    )
+  )
+  with check (ranch_id = public.current_ranch_id());
+
+create policy "members read collars"
+  on public.collars for select
+  to authenticated
+  using (ranch_id = public.current_ranch_id());
+
+create policy "members read uplinks"
+  on public.uplinks for select
+  to authenticated
+  using (
+    exists (
+      select 1 from public.collars
+      where collars.id = uplinks.collar_id
+        and collars.ranch_id = public.current_ranch_id()
+    )
+  );
+
+create policy "service inserts uplinks"
+  on public.uplinks for insert
+  to authenticated
+  with check (
+    exists (
+      select 1 from public.collars
+      where collars.id = uplinks.collar_id
+        and collars.ranch_id = public.current_ranch_id()
+    )
+  );
+
+create policy "members read alerts"
+  on public.alerts for select
+  to authenticated
+  using (ranch_id = public.current_ranch_id());
+
+create policy "members acknowledge alerts"
+  on public.alerts for update
+  to authenticated
+  using (ranch_id = public.current_ranch_id())
+  with check (ranch_id = public.current_ranch_id());
+
+create policy "users read their chat"
+  on public.chat_messages for select
+  to authenticated
+  using (user_id = auth.uid());
+
+create policy "users insert their chat"
+  on public.chat_messages for insert
+  to authenticated
+  with check (user_id = auth.uid());
+
+grant select, insert, update, delete on
+  public.ranches,
+  public.profiles,
+  public.notification_settings,
+  public.pastures,
+  public.gateways,
+  public.animals,
+  public.collars,
+  public.uplinks,
+  public.alerts,
+  public.chat_messages
+to authenticated;
+
+grant select on public.collar_latest to authenticated;
